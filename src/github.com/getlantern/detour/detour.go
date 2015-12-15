@@ -196,8 +196,8 @@ func Dialer(detourDialer dialFunc) func(network, addr string) (net.Conn, error) 
 		}()
 
 		chLastError := make(chan error, 2)
-		// Merge dialing results. Run until all dialing attempt returns
-		// to prevent leaking connections.
+		// Merge dialing results. Run until all dialing attempts return
+		// to avoid leaking connections.
 		go func() {
 			var res dialResult
 			for i := 0; i < numDial; i++ {
@@ -238,17 +238,23 @@ func (dc *Conn) ioLoop() {
 	for {
 		select {
 		case c := <-dc.chConnToIOLoop:
-			log.Tracef("I/O loop got %s connection to %s", c.Type(), dc.addr)
+			log.Tracef("***I/O loop got %s connection to %s", c.Type(), dc.addr)
 			if dc.anyDataReceived() {
 				log.Debugf("%s connection to %s available after data received, closing", c.Type(), dc.addr)
 				closeConn(c)
 				continue
 			}
+			var reRead bool
 			if firstReadReq != nil {
 				if !dc.replay(c) {
 					closeConn(c)
 					continue
 				}
+				reRead = true
+			}
+			chConns <- c
+			// spawn goroutine after above statement so channel operations is in determined order
+			if reRead {
 				go func() {
 					buf := make([]byte, len(firstReadReq.buf))
 					n, err := c.Read(buf, true)
@@ -257,13 +263,13 @@ func (dc *Conn) ioLoop() {
 						closeConn(c)
 						chRemoveConn <- c
 					} else {
-						log.Tracef("Read %d bytes from %s connection to %s", n, c.Type(), dc.addr)
+						log.Tracef("Re-read %d bytes from %s connection to %s", n, c.Type(), dc.addr)
 					}
 					firstReadReq.chResult <- readResult{buf[:n], err}
 				}()
 			}
-			chConns <- c
 		case r := <-chRemoveConn:
+			log.Trace("***I/O loop got remove connection request")
 			tries := len(chConns)
 			for i := 0; i < tries; i++ {
 				c := <-chConns
@@ -272,12 +278,13 @@ func (dc *Conn) ioLoop() {
 				}
 			}
 		case req := <-dc.chReadRequest:
-			tries := len(chConns)
-			chs := make(chan readResult, tries)
+			log.Trace("***I/O loop got read request")
+			chMergeReads := make(chan readResult)
 			first := !dc.anyDataReceived()
 			if first {
-				firstReadReq = &readRequest{req.buf, chs}
+				firstReadReq = &readRequest{req.buf, chMergeReads}
 			}
+			tries := len(chConns)
 			// read from all valid connections, typically only one
 			for i := 0; i < tries; i++ {
 				c := <-chConns
@@ -293,26 +300,28 @@ func (dc *Conn) ioLoop() {
 						switch c.Type() {
 						case connTypeDirect:
 							// if we haven't dial detour yet, do so now
-							dc.chDialDetourNow <- true
-							return
+							// just a hint, skip if no receiver
+							select {
+							case dc.chDialDetourNow <- true:
+							default:
+							}
 						case connTypeDetour:
 							log.Tracef("Detour connection to %s failed, removing from whitelist", dc.addr)
 							RemoveFromWl(dc.addr)
 						}
 					} else {
 						log.Tracef("Read %d bytes from %s connection to %s", n, c.Type(), dc.addr)
-						dc.incReadBytes(n)
 					}
-					chs <- readResult{buf[:n], err}
+					chMergeReads <- readResult{buf[:n], err}
 				}()
 			}
-			// Merge read responses, return only one copy to caller and ignore others.
-			// The response of re-read request also goes here
+			// Merge read responses, return first succeeded one to caller and ignore later, or return the last error if both failed.
+			// Fixed to 2 because the response of re-read request also goes here.
 			go func() {
 				var got bool
-				for i := 0; i < tries; i++ {
-					result := <-chs
-					if result.err != nil && i < tries-1 {
+				for i := 0; i < 2; i++ {
+					result := <-chMergeReads
+					if result.err != nil && i == 0 {
 						log.Debugf("Error read from %s, ignore: %s", dc.addr, result.err)
 						continue
 					}
@@ -329,6 +338,7 @@ func (dc *Conn) ioLoop() {
 				}
 			}()
 		case req := <-dc.chWriteRequest:
+			log.Trace("***I/O loop got write request")
 			if !dc.anyDataReceived() {
 				if isNonidempotentHTTPRequest(req.buf) {
 					atomic.StoreUint32(&dc.nonidempotentHTTPRequest, 1)
@@ -357,6 +367,7 @@ func (dc *Conn) ioLoop() {
 				req.chResult <- writeResult{0, errors.New("fail to write to any connection")}
 			}
 		case req := <-dc.chGetAddr:
+			log.Trace("***I/O loop got GetAddr request")
 			if len(chConns) == 0 {
 				panic("should have at least one valid connection")
 			}
@@ -368,6 +379,7 @@ func (dc *Conn) ioLoop() {
 				req.chResult <- c.RemoteAddr()
 			}
 		case <-dc.chClose:
+			log.Trace("***I/O loop got close request")
 			tries := len(chConns)
 			for i := 0; i < tries; i++ {
 				closeConn(<-chConns)
@@ -410,7 +422,9 @@ func (dc *Conn) Read(b []byte) (n int, err error) {
 	ch := make(chan readResult)
 	dc.chReadRequest <- readRequest{b, ch}
 	result := <-ch
-	return len(result.buf), result.err
+	n, err = len(result.buf), result.err
+	dc.incReadBytes(n)
+	return
 
 }
 
@@ -424,7 +438,11 @@ func (dc *Conn) Write(b []byte) (n int, err error) {
 
 // Close implements the function from net.Conn
 func (dc *Conn) Close() error {
-	close(dc.chClose)
+	// prevent multiple call of Close() from panicking
+	if dc.chClose != nil {
+		close(dc.chClose)
+		dc.chClose = nil
+	}
 	return nil
 }
 
